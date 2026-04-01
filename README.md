@@ -109,6 +109,31 @@ openclaw tui
 
 Alternatively, send a single message and print the response:
 
+> **ℹ️ Note**
+>
+> The TUI is best for interactive back-and-forth. If you need the full text of a long response such as a large code generation output, use the CLI instead.
+
+#### Update the NemoClaw OpenClaw plugin (development)
+
+If you change the NemoClaw plugin source (for example Steward-governed `/nemoclaw policy` commands), rebuild and copy the new `dist/` into the sandbox’s OpenClaw extensions directory, then restart the TUI.
+
+From a clone of this repo on your **host** (where Docker can reach your OpenShell cluster):
+
+```bash
+cd NemoClaw
+bash scripts/deploy-nemoclaw-plugin.sh
+```
+
+The script builds `nemoclaw/`, creates an archive, copies it into the sandbox pod (via `docker` + `kubectl` inside `openshell-cluster-nemoclaw`, or host `kubectl` if Docker is absent), rotates `dist.bak`, replaces `/sandbox/.openclaw-data/extensions/nemoclaw/dist`, and prints a suggested `openclaw tui` restart command.
+
+Set `SANDBOX_NAME`, `NAMESPACE`, or `CLUSTER_CONTAINER` if your environment differs from the defaults.
+
+**Manual step:** always **fully quit and relaunch** `openclaw tui` inside the sandbox so the process reloads the plugin. If files were copied from macOS, ensure plugin files are owned by the sandbox user (the script uses `tar --no-same-owner` and `chown` when possible).
+
+#### OpenClaw CLI
+
+In the sandbox shell, run the following command to send a single message and print the response:
+
 ```bash
 openclaw agent --agent main --local -m "hello" --session-id test
 ```
