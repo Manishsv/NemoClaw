@@ -77,7 +77,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sandbox-test-image
           path: /tmp
@@ -97,7 +97,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Download image artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: isolation-image
           path: /tmp
