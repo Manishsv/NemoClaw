@@ -25,6 +25,10 @@
         "type": "string",
         "description": "Default inference provider type (nvidia, vllm, openai-compatible)",
         "default": "nvidia"
+      },
+      "stewardUrl": {
+        "type": "string",
+        "description": "Steward governance base URL (e.g. http://host.openshell.internal:8010). Required when STEWARD_URL is not visible to the plugin process (typical for OpenClaw TUI/sandbox)."
       }
     },
     "additionalProperties": false

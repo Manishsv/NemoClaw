@@ -14,7 +14,18 @@ import {
 } from "../onboard/config.js";
 import JSON5 from "json5";
 
-import { stewardAuthorize, stewardEvaluateCandidates, stewardExecute } from "../steward/client.js";
+import {
+  stewardAuthorize,
+  stewardCompleteApprovalFromAuthorizeAuditId,
+  stewardEvaluateCandidates,
+  stewardExecute,
+  stewardGetAudit,
+  stewardGetDecisionRecord,
+  stewardGetExecutionRecord,
+  isStewardError,
+  parseStewardExecute403Detail,
+  stewardResolvedBaseUrl,
+} from "../steward/client.js";
 import {
   popTrailingPolicyFlags,
   renderGovernanceTechnical,
@@ -25,6 +36,11 @@ import {
   shortenOneLine,
   policyOpHighRisk,
 } from "./policy-render.js";
+import {
+  renderAuditRecord,
+  renderDecisionRecord,
+  renderExecutionRecord,
+} from "./records-render.js";
 
 export async function handleSlashCommand(
   ctx: PluginCommandContext,
@@ -41,6 +57,10 @@ export async function handleSlashCommand(
       return slashOnboard();
     case "policy":
       return await slashPolicy(ctx, api);
+    case "approval":
+      return await slashApproval(ctx, api);
+    case "records":
+      return await slashRecords(ctx, api);
     case "request":
       return await slashRequest(ctx, api);
     default:
@@ -59,8 +79,10 @@ function slashHelp(): PluginCommandResult {
       "  `status`  - Show sandbox, blueprint, and inference state",
       "  `eject`   - Show rollback instructions",
       "  `onboard` - Show onboarding status and instructions",
-      "  `policy`  - Govern OpenShell draft policy (via Steward)",
-      "  `request` - Turn a natural-language request into governed actions",
+      "  `policy`   - Govern OpenShell draft policy (via Steward)",
+      "  `approval` - Operator: complete Steward approval from an authorize audit id",
+      "  `records`  - Operator: inspect Steward audit / decision / execution records",
+      "  `request`  - Turn a natural-language request into governed actions",
       "",
       "For full management use the NemoClaw CLI:",
       "  `nemoclaw <name> status`",
@@ -69,6 +91,248 @@ function slashHelp(): PluginCommandResult {
       "  `nemoclaw <name> destroy`",
     ].join("\n"),
   };
+}
+
+async function slashApproval(
+  ctx: PluginCommandContext,
+  api: OpenClawPluginApi,
+): Promise<PluginCommandResult> {
+  const rawTokens = (ctx.args ?? "").trim().split(/\s+/).filter(Boolean);
+  const verb = rawTokens[1] ?? "";
+  const auditId = (rawTokens[2] ?? "").trim();
+
+  const usage = [
+    "**NemoClaw approval (operator)**",
+    "",
+    "Complete Steward approval for a prior **authorize** audit that returned `needs_approval`:",
+    "  `/nemoclaw approval complete <authorize-audit-id>`",
+    "",
+    "Inspect an audit record (same as **`/nemoclaw records audit`**):",
+    "  `/nemoclaw approval audit <audit-id>`  or  `/nemoclaw records audit <audit-id>`",
+    "",
+    "Steward: GET `/audit/{id}` → POST `/approval-requests` → POST decision `approved` → POST `/action/execute` with resume context.",
+    "",
+    "Requires an **authorized operator** sender in your OpenClaw policy.",
+  ].join("\n");
+
+  if (verb === "audit") {
+    if (!auditId) {
+      return {
+        text: [
+          "**Audit inspection** uses **`records`**, not `approval` alone.",
+          "",
+          "  `/nemoclaw records audit <audit-id>`",
+          "",
+          "Or (operator alias): `/nemoclaw approval audit <audit-id>`",
+          "",
+          usage,
+        ].join("\n"),
+      };
+    }
+    if (!ctx.isAuthorizedSender) {
+      return {
+        text: [
+          "**Operator only**",
+          "",
+          "Only authorized operators may run this command.",
+          "",
+          usage,
+        ].join("\n"),
+      };
+    }
+    try {
+      const audit = await stewardGetAudit(auditId);
+      return { text: renderAuditRecord(audit) };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return {
+        text: ["**Records lookup failed**", "", msg, "", usage].join("\n"),
+      };
+    }
+  }
+
+  if (verb !== "complete" || !auditId) {
+    return { text: usage };
+  }
+
+  if (!ctx.isAuthorizedSender) {
+    return {
+      text: [
+        "**Operator only**",
+        "",
+        "Only authorized operators may run this command.",
+        "",
+        usage,
+      ].join("\n"),
+    };
+  }
+
+  const decidedBy = ctx.senderId ? `user:${ctx.senderId}` : "operator:tui";
+  try {
+    const out = await stewardCompleteApprovalFromAuthorizeAuditId(auditId, decidedBy);
+    api.logger.info(`nemoclaw approval complete audit=${auditId} execute_audit=${out.audit_id}`);
+    const sandbox =
+      typeof out.resumed_parameters.sandbox_name === "string"
+        ? out.resumed_parameters.sandbox_name
+        : "(see action parameters)";
+    const runtimeLine = summarizeRuntimeForBusiness(out.result);
+    const ok = out.result.ok === true;
+    return {
+      text: [
+        "**Approval completed and execution finished**",
+        "",
+        "**What was requested**",
+        `- Action: \`${out.resumed_action}\``,
+        `- Purpose: ${shortenOneLine(out.resumed_purpose, 200) || "(none)"}`,
+        `- Sandbox / target: ${sandbox}`,
+        "",
+        "**Governance**",
+        `- Approved proposal (storage id): \`${out.governance_proposal_id}\``,
+        `- Approval request used: \`${out.approval_request_id}\``,
+        `- Authorize audit: \`${auditId}\``,
+        "",
+        "**Execution**",
+        `- Execute audit: \`${out.audit_id}\``,
+        `- Runtime: ${runtimeLine}`,
+        `- Overall: ${ok ? "success" : "governance allowed after approval, but runtime reported failure"}`,
+        "",
+        "**Inspect records**",
+        `- \`/nemoclaw records audit ${auditId}\` (authorize pass)`,
+        `- \`/nemoclaw records audit ${out.audit_id}\` (execute pass)`,
+      ].join("\n"),
+    };
+  } catch (e) {
+    const parsed403 = isStewardError(e) ? parseStewardExecute403Detail(e.body) : null;
+    if (parsed403?.decision === "allow" && parsed403.audit_id) {
+      api.logger.warn(
+        `nemoclaw approval complete runtime_failed authorize_audit=${auditId} execute_audit=${parsed403.audit_id}`,
+      );
+      const hint = parsed403.user_hint ? shortenOneLine(parsed403.user_hint, 220) : "";
+      return {
+        text: [
+          "**Approval completed; execution failed (runtime)**",
+          "",
+          "Governance allowed this action after approval, but OpenShell or downstream execution did not succeed.",
+          hint ? `Hint: ${hint}` : null,
+          "",
+          `Authorize audit: \`${auditId}\``,
+          `Execute audit: \`${parsed403.audit_id}\``,
+          parsed403.decision_record_id
+            ? `Decision record: \`${parsed403.decision_record_id}\``
+            : null,
+          parsed403.execution_record_id
+            ? `Execution record: \`${parsed403.execution_record_id}\``
+            : null,
+          "",
+          "**Next step**",
+          `- \`/nemoclaw records audit ${parsed403.audit_id}\``,
+          parsed403.execution_record_id
+            ? `- \`/nemoclaw records execution ${parsed403.execution_record_id}\``
+            : null,
+        ]
+          .filter(Boolean)
+          .join("\n"),
+      };
+    }
+    if (isStewardError(e) && e.status === 404) {
+      const base = stewardResolvedBaseUrl();
+      api.logger.warn(`nemoclaw approval complete audit_not_found audit=${auditId} base=${base}`);
+      return {
+        text: [
+          "**Cannot complete approval — Steward has no audit with this id**",
+          "",
+          `Tried \`GET /audit/${auditId}\` against **${base}** and got **404** (not found).`,
+          "",
+          "**Most likely:** Steward’s audit store is **in-memory**. A **process restart** clears it — including **`uvicorn --reload`** when Python files change. The authorize step and **`approval complete`** must hit the **same** Steward process **without** a restart in between.",
+          "",
+          "**What to do:** Run **`/nemoclaw policy approve-all manz`** (or your command) again, then **`/nemoclaw approval complete <new-audit-id>`** right away. For a stable dev loop, run Steward **without** `--reload`, or accept re-authorizing after each reload.",
+          "",
+          "**Also verify:** **`STEWARD_URL`** for NemoClaw matches the Steward you used for the policy command (e.g. `127.0.0.1` vs `host.openshell.internal` vs Docker).",
+        ].join("\n"),
+      };
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    api.logger.warn(
+      `nemoclaw approval complete failed audit=${auditId} err=${shortenOneLine(msg, 200)}`,
+    );
+    return {
+      text: ["**Approval workflow failed**", "", msg].join("\n"),
+    };
+  }
+}
+
+async function slashRecords(
+  ctx: PluginCommandContext,
+  _api: OpenClawPluginApi,
+): Promise<PluginCommandResult> {
+  const rawTokens = (ctx.args ?? "").trim().split(/\s+/).filter(Boolean);
+  const kind = (rawTokens[1] ?? "").toLowerCase();
+  const id = (rawTokens[2] ?? "").trim();
+
+  const usage = [
+    "**NemoClaw records (operator)**",
+    "",
+    "Read Steward governance and execution records (no curl):",
+    "  `/nemoclaw records audit <audit-id>`",
+    "  `/nemoclaw records decision <decision-record-id>`",
+    "  `/nemoclaw records execution <execution-record-id>`",
+    "",
+    "Requires an **authorized operator** sender.",
+  ].join("\n");
+
+  if (!kind || !id) {
+    return { text: usage };
+  }
+
+  if (!ctx.isAuthorizedSender) {
+    return {
+      text: [
+        "**Operator only**",
+        "",
+        "Only authorized operators may run this command.",
+        "",
+        usage,
+      ].join("\n"),
+    };
+  }
+
+  try {
+    if (kind === "audit") {
+      const audit = await stewardGetAudit(id);
+      return { text: renderAuditRecord(audit) };
+    }
+    if (kind === "decision") {
+      const rec = await stewardGetDecisionRecord(id);
+      return { text: renderDecisionRecord(rec) };
+    }
+    if (kind === "execution") {
+      const rec = await stewardGetExecutionRecord(id);
+      return { text: renderExecutionRecord(rec) };
+    }
+    return { text: usage };
+  } catch (e) {
+    if (isStewardError(e) && e.status === 404 && kind === "audit") {
+      const base = stewardResolvedBaseUrl();
+      return {
+        text: [
+          "**Audit not found in Steward**",
+          "",
+          `Tried \`GET /audit/${id}\` against **${base}** and got **404**.`,
+          "",
+          "**Most likely:** Steward’s audit store is **in-memory**. If Steward restarted (including `uvicorn --reload`) after the audit id was created, the record is gone.",
+          "",
+          "**What to do:** re-run the original `/nemoclaw policy ...` to generate a new audit id, then immediately inspect it:",
+          `- \`/nemoclaw records audit <new-audit-id>\``,
+          "",
+          "**Also verify:** you’re pointing at the same Steward instance (host/port) that produced the audit id.",
+          "",
+          usage,
+        ].join("\n"),
+      };
+    }
+    const msg = e instanceof Error ? e.message : String(e);
+    return { text: ["**Records lookup failed**", "", msg, "", usage].join("\n") };
+  }
 }
 
 async function slashRequest(
@@ -578,6 +842,18 @@ async function slashPolicy(
     api.logger.warn(
       `nemoclaw policy ${op} authorize_failed sandbox=${sandboxName} err=${shortenOneLine(msg, 200)}`,
     );
+    const envHint =
+      /Steward is unreachable|unreachable/i.test(msg) && /:80\d\d\//.test(msg)
+        ? [
+            "",
+            "OpenClaw often does **not** pass `STEWARD_URL` into the NemoClaw plugin. If `openclaw.json` is read-only, create **`steward-url`** (one line: your Steward base URL) under **`$OPENCLAW_STATE_DIR`** or **`/sandbox/.openclaw-data/`**, e.g. `printf '%s\\n' 'http://host.openshell.internal:8010' > /sandbox/.openclaw-data/steward-url`, then retry. Or set **`plugins.config.nemoclaw.stewardUrl`** in config when you can edit it.",
+          ].join("\n")
+        : /Steward is unreachable/i.test(msg)
+          ? [
+              "",
+              "If the URL looks wrong, set **`stewardUrl`** in the nemoclaw plugin config or ensure `STEWARD_URL` reaches this process.",
+            ].join("\n")
+          : "";
     return {
       text: [
         "**Policy blocked**",
@@ -585,7 +861,10 @@ async function slashPolicy(
         "Steward could not authorize this request (fail-closed).",
         "",
         msg,
-      ].join("\n"),
+        envHint,
+      ]
+        .filter(Boolean)
+        .join("\n"),
     };
   }
 
@@ -595,6 +874,17 @@ async function slashPolicy(
         auth.decision === "deny"
           ? "Governance: this read was not allowed."
           : "Governance: an approver must allow this before you can view details.";
+      const approvalBits =
+        auth.decision === "needs_approval"
+          ? [
+              "",
+              `Operator handle (authorize audit): \`${auth.audit_id}\``,
+              "Next step (operator):",
+              `  \`/nemoclaw approval complete ${auth.audit_id}\``,
+              "",
+              "Note: Steward audits are **in-memory** — **`uvicorn --reload`** or a restart clears them; use the **same** running Steward (and **`STEWARD_URL`**) for policy and **`approval complete`**, or re-run **`policy`** for a new id.",
+            ]
+          : [];
       return {
         text: [
           "**Network access review**",
@@ -605,10 +895,11 @@ async function slashPolicy(
           shortenOneLine(auth.rationale, 200)
             ? `Note: ${shortenOneLine(auth.rationale, 200)}`
             : null,
+          ...approvalBits,
           "",
-          "Next step: contact an operator or retry with appropriate approval.",
-          "",
-          "Tip: add `details` or `audit` for troubleshooting.",
+          auth.decision === "deny"
+            ? "Next step: contact an operator or adjust the request."
+            : "Tip: add `details` or `audit` for full correlation ids.",
         ]
           .filter(Boolean)
           .join("\n"),
@@ -622,6 +913,7 @@ async function slashPolicy(
       rationale: auth.rationale,
       highRisk,
       executed: false,
+      authorizeAuditId: auth.audit_id,
     });
     const text = flags.details ? `${business}\n\n---\n\n${technical}` : business;
     api.logger.info(

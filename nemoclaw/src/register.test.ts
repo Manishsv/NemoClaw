@@ -77,6 +77,17 @@ describe("plugin registration", () => {
       expect.objectContaining({ id: "inference/nvidia/custom-model" }),
     ]);
   });
+
+  it("logs Steward banner line when stewardUrl is configured", () => {
+    const api = createMockApi();
+    api.pluginConfig = { stewardUrl: "http://host.openshell.internal:8010" };
+    register(api);
+    const logs = vi
+      .mocked(api.logger.info)
+      .mock.calls.map((c) => (typeof c[0] === "string" ? c[0] : ""));
+    expect(logs.join("\n")).toContain("Steward:");
+    expect(logs.join("\n")).toContain("host.openshell.internal:8010");
+  });
 });
 
 describe("getPluginConfig", () => {
@@ -111,5 +122,32 @@ describe("getPluginConfig", () => {
     expect(config.blueprintRegistry).toBe("ghcr.io/custom/registry");
     expect(config.sandboxName).toBe("custom-sandbox");
     expect(config.inferenceProvider).toBe("openai");
+  });
+
+  it("reads stewardUrl from api.config.plugins.config.nemoclaw when pluginConfig is empty", () => {
+    const api = createMockApi();
+    api.pluginConfig = {};
+    api.config = {
+      plugins: {
+        allow: ["nemoclaw"],
+        config: {
+          nemoclaw: { stewardUrl: "http://steward-from-openclaw-json.test" },
+        },
+      },
+    };
+    const config = getPluginConfig(api);
+    expect(config.stewardUrl).toBe("http://steward-from-openclaw-json.test");
+  });
+
+  it("pluginConfig stewardUrl overrides openclaw.json plugins.config.nemoclaw", () => {
+    const api = createMockApi();
+    api.config = {
+      plugins: {
+        config: { nemoclaw: { stewardUrl: "http://from-file.test" } },
+      },
+    };
+    api.pluginConfig = { stewardUrl: "http://from-host.test" };
+    const config = getPluginConfig(api);
+    expect(config.stewardUrl).toBe("http://from-host.test");
   });
 });

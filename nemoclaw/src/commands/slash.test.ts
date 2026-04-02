@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { PluginCommandContext, OpenClawPluginApi } from "../index.js";
 import type { NemoClawState } from "../blueprint/state.js";
 import type { NemoClawOnboardConfig } from "../onboard/config.js";
@@ -96,6 +96,8 @@ describe("commands/slash", () => {
       expect(result.text).toContain("eject");
       expect(result.text).toContain("onboard");
       expect(result.text).toContain("policy");
+      expect(result.text).toContain("approval");
+      expect(result.text).toContain("records");
     });
 
     it("returns help text for unknown subcommand", async () => {
@@ -339,6 +341,9 @@ describe("commands/slash", () => {
       const result = await handleSlashCommand(makeCtx("policy clear manz"), makeApi());
       expect(result.text).toContain("Approval required");
       expect(result.text).toContain("rationale:needs_approval");
+      expect(result.text).toContain("/nemoclaw approval complete");
+      expect(result.text).toContain("audit-auth-needs_approval");
+      expect(result.text).toMatch(/in memory|in-memory/i);
 
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       fetchSpy.mockRestore();
@@ -383,6 +388,21 @@ describe("commands/slash", () => {
       expect(result.text).toMatch(/allowed this read|policy service allowed/i);
 
       expect(fetchSpy).toHaveBeenCalledTimes(2);
+      fetchSpy.mockRestore();
+    });
+
+    it("get with needs_approval shows audit handle and in-memory note in short mode", async () => {
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(stewardAuth("needs_approval"));
+
+      const result = await handleSlashCommand(makeCtx("policy get manz"), makeApi());
+      expect(result.text).toContain("Network access review");
+      expect(result.text).toContain("/nemoclaw approval complete");
+      expect(result.text).toContain("audit-auth-needs_approval");
+      expect(result.text).toMatch(/in-memory|in memory/i);
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
       fetchSpy.mockRestore();
     });
 
@@ -448,6 +468,369 @@ describe("commands/slash", () => {
 
       const result = await handleSlashCommand(makeCtx("policy approve_all manz"), makeApi());
       expect(result.text).toContain("Approval required");
+      expect(result.text).toContain("/nemoclaw approval complete");
+      expect(result.text).toMatch(/in memory|in-memory/i);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      fetchSpy.mockRestore();
+    });
+
+    it("integration: needs_approval then operator approval complete resumes same proposal", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      fetchSpy
+        .mockResolvedValueOnce(stewardAuth("needs_approval"))
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "auth-audit-int",
+              governance_proposal_id: "gp-int",
+              proposal: {
+                action: "openshell.draft_policy.approve_all",
+                purpose: "bulk",
+                role: "agent",
+                context: {},
+                parameters: { sandbox_name: "manz" },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-int",
+              state: "requested",
+              governance_proposal_id: "gp-int",
+              decision_record_id: "dr-int",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-int",
+              state: "approved",
+              governance_proposal_id: "gp-int",
+              decision_record_id: "dr-int",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              audit_id: "exec-int",
+              status: "executed",
+              result: { ok: true },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+
+      const policyOut = await handleSlashCommand(makeCtx("policy approve_all manz"), makeApi());
+      expect(policyOut.text).toContain("audit-auth-needs_approval");
+
+      const approvalOut = await handleSlashCommand(
+        makeCtx("approval complete audit-auth-needs_approval"),
+        makeApi(),
+      );
+      expect(approvalOut.text).toContain("Approval completed and execution finished");
+      expect(approvalOut.text).toContain("gp-int");
+      expect(approvalOut.text).toContain("ar-int");
+      expect(approvalOut.text).toContain("openshell.draft_policy.approve_all");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(5);
+      const execInit = fetchSpy.mock.calls[4][1] as RequestInit;
+      const execBody = JSON.parse(execInit.body as string) as {
+        proposal: {
+          context?: Record<string, unknown>;
+          action: string;
+          parameters: Record<string, unknown>;
+        };
+      };
+      expect(execBody.proposal.context?.steward_resume_proposal_id).toBe("gp-int");
+      expect(execBody.proposal.context?.approval_request_id).toBe("ar-int");
+      expect(execBody.proposal.action).toBe("openshell.draft_policy.approve_all");
+      expect(execBody.proposal.parameters.sandbox_name).toBe("manz");
+
+      fetchSpy.mockRestore();
+    });
+
+    it("integration: approval complete after governance allow but runtime failure surfaces distinction", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      fetchSpy
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              governance_proposal_id: "gp-rt",
+              proposal: {
+                action: "openshell.draft_policy.clear",
+                purpose: "x",
+                role: "agent",
+                context: {},
+                parameters: { sandbox_name: "s" },
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-rt",
+              state: "requested",
+              governance_proposal_id: "gp-rt",
+              decision_record_id: "dr-rt",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-rt",
+              state: "approved",
+              governance_proposal_id: "gp-rt",
+              decision_record_id: "dr-rt",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              detail: {
+                audit_id: "exec-fail-1",
+                decision: "allow",
+                rationale: "ok",
+                result: { ok: false, error: "external_call_failed" },
+                user_hint: "Governance allowed but runtime failed.",
+                decision_record_id: "dr-ex",
+                execution_record_id: "er-ex",
+              },
+            }),
+            { status: 403, headers: { "content-type": "application/json" } },
+          ),
+        );
+
+      const result = await handleSlashCommand(
+        makeCtx("approval complete auth-audit-rt"),
+        makeApi(),
+      );
+      expect(result.text).toContain("Approval completed; execution failed (runtime)");
+      expect(result.text).toContain("Governance allowed");
+      expect(result.text).toContain("exec-fail-1");
+      expect(result.text).toContain("er-ex");
+      expect(result.text).toContain("/nemoclaw records");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(4);
+      fetchSpy.mockRestore();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // approval (operator Steward lifecycle)
+  // -------------------------------------------------------------------------
+
+  describe("approval", () => {
+    beforeEach(() => {
+      process.env.STEWARD_URL = "http://steward.test";
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      delete process.env.STEWARD_URL;
+    });
+
+    it("shows usage when incomplete", async () => {
+      const result = await handleSlashCommand(makeCtx("approval"), makeApi());
+      expect(result.text).toContain("approval complete");
+      expect(result.text).toContain("authorize-audit-id");
+    });
+
+    it("approval audit <id> aliases records audit (GET /audit)", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "alias-a1",
+            kind: "authorize",
+            decision: "needs_approval",
+            proposal: { action: "openshell.draft_policy.get", purpose: "read" },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+      const result = await handleSlashCommand(makeCtx("approval audit alias-a1"), makeApi());
+      expect(result.text).toContain("Steward audit");
+      expect(result.text).toContain("alias-a1");
+      expect(urlToString(fetchSpy.mock.calls[0][0])).toContain("/audit/alias-a1");
+      fetchSpy.mockRestore();
+    });
+
+    it("rejects non-operators before calling Steward", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const ctx = makeCtx("approval complete auth-audit-1");
+      ctx.isAuthorizedSender = false;
+      const result = await handleSlashCommand(ctx, makeApi());
+      expect(result.text).toMatch(/Operator only/i);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      fetchSpy.mockRestore();
+    });
+
+    it("explains 404 when authorize audit is gone (restart / wrong STEWARD_URL)", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "audit record not found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const result = await handleSlashCommand(
+        makeCtx("approval complete gone-audit-id"),
+        makeApi(),
+      );
+      expect(result.text).toContain("Cannot complete approval");
+      expect(result.text).toContain("404");
+      expect(result.text).toMatch(/in-memory|in memory/i);
+      expect(result.text).toContain("steward.test");
+      expect(result.text).toContain("STEWARD_URL");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      fetchSpy.mockRestore();
+    });
+
+    it("operator runs GET audit, approval-requests, decision, execute", async () => {
+      const auditBody = {
+        id: "auth-audit-1",
+        governance_proposal_id: "gp-99",
+        proposal: {
+          action: "openshell.draft_policy.clear",
+          purpose: "clear test",
+          role: "agent",
+          context: {},
+          parameters: { sandbox_name: "manz" },
+        },
+      };
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      fetchSpy
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify(auditBody), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-1",
+              state: "requested",
+              governance_proposal_id: "gp-99",
+              decision_record_id: "dr-1",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              id: "ar-1",
+              state: "approved",
+              governance_proposal_id: "gp-99",
+              decision_record_id: "dr-1",
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        )
+        .mockResolvedValueOnce(
+          new Response(
+            JSON.stringify({
+              audit_id: "exec-audit-1",
+              status: "executed",
+              result: { ok: true, chunks_cleared: 0 },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        );
+
+      const result = await handleSlashCommand(makeCtx("approval complete auth-audit-1"), makeApi());
+      expect(result.text).toContain("Approval completed and execution finished");
+      expect(result.text).toContain("auth-audit-1");
+      expect(result.text).toContain("exec-audit-1");
+      expect(result.text).toContain("gp-99");
+      expect(result.text).toContain("ar-1");
+      expect(result.text).toContain("openshell.draft_policy.clear");
+
+      expect(fetchSpy).toHaveBeenCalledTimes(4);
+      const urls = fetchSpy.mock.calls.map((c) => urlToString(c[0]));
+      expect(urls[0]).toContain("/audit/auth-audit-1");
+      expect(urls[1]).toContain("/approval-requests");
+      expect(urls[2]).toContain("/approval-requests/ar-1/decision");
+      expect(urls[3]).toContain("/action/execute");
+
+      const execBody = JSON.parse((fetchSpy.mock.calls[3][1] as RequestInit).body as string) as {
+        proposal: { context?: Record<string, unknown> };
+      };
+      expect(execBody.proposal.context?.steward_resume_proposal_id).toBe("gp-99");
+      expect(execBody.proposal.context?.approval_request_id).toBe("ar-1");
+
+      fetchSpy.mockRestore();
+    });
+  });
+
+  describe("records", () => {
+    beforeEach(() => {
+      process.env.STEWARD_URL = "http://steward.test";
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      delete process.env.STEWARD_URL;
+    });
+
+    it("rejects non-operators", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch");
+      const ctx = makeCtx("records audit x");
+      ctx.isAuthorizedSender = false;
+      const result = await handleSlashCommand(ctx, makeApi());
+      expect(result.text).toMatch(/Operator only/i);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      fetchSpy.mockRestore();
+    });
+
+    it("fetches audit summary", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "a1",
+            kind: "authorize",
+            decision: "needs_approval",
+            rationale: "policy",
+            governance_proposal_id: "gp1",
+            proposal: { action: "openshell.draft_policy.get", purpose: "read" },
+            operator_hints: { nemoclaw_approval_complete: "/nemoclaw approval complete a1" },
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+      );
+      const result = await handleSlashCommand(makeCtx("records audit a1"), makeApi());
+      expect(result.text).toContain("Steward audit");
+      expect(result.text).toContain("a1");
+      expect(result.text).toContain("nemoclaw_approval_complete");
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(urlToString(fetchSpy.mock.calls[0][0])).toContain("/audit/a1");
+      fetchSpy.mockRestore();
+    });
+
+    it("explains 404 for records audit (in-memory / wrong instance)", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
+        new Response(JSON.stringify({ detail: "audit record not found" }), {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+      const result = await handleSlashCommand(makeCtx("records audit missing-a1"), makeApi());
+      expect(result.text).toContain("Audit not found in Steward");
+      expect(result.text).toContain("404");
+      expect(result.text).toMatch(/in-memory|in memory/i);
+      expect(result.text).toContain("steward.test");
       expect(fetchSpy).toHaveBeenCalledTimes(1);
       fetchSpy.mockRestore();
     });

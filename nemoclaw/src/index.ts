@@ -12,6 +12,7 @@
  */
 
 import { handleSlashCommand } from "./commands/slash.js";
+import { setPluginStewardBaseUrl } from "./steward/client.js";
 import {
   describeOnboardEndpoint,
   describeOnboardProvider,
@@ -131,6 +132,8 @@ export interface NemoClawConfig {
   blueprintRegistry: string;
   sandboxName: string;
   inferenceProvider: string;
+  /** Steward HTTP origin when this process does not see `STEWARD_URL` (common in OpenClaw plugins). */
+  stewardUrl?: string;
 }
 
 function activeModelEntries(
@@ -208,8 +211,37 @@ const DEFAULT_PLUGIN_CONFIG: NemoClawConfig = {
   inferenceProvider: "nvidia",
 };
 
+/** Nemoclaw keys from openclaw.json (OpenClaw may expose these on api.config.plugins, not pluginConfig). */
+function nemoclawSettingsFromOpenclawConfig(
+  config: OpenClawConfig | undefined,
+): Record<string, unknown> {
+  if (!config || typeof config !== "object") return {};
+  const plugins = config.plugins as Record<string, unknown> | undefined;
+  if (!plugins || typeof plugins !== "object" || Array.isArray(plugins)) return {};
+
+  const asObj = (o: unknown): Record<string, unknown> | null =>
+    o !== null && typeof o === "object" && !Array.isArray(o)
+      ? (o as Record<string, unknown>)
+      : null;
+
+  const fromConfig = asObj(plugins.config)?.nemoclaw;
+  const n1 = asObj(fromConfig);
+  if (n1) return n1;
+
+  const fromEntries = asObj(plugins.entries)?.nemoclaw;
+  const n2 = asObj(fromEntries);
+  if (n2) return n2;
+
+  const n3 = asObj(plugins.nemoclaw);
+  if (n3) return n3;
+
+  return {};
+}
+
 export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
-  const raw = api.pluginConfig ?? {};
+  const fromFile = nemoclawSettingsFromOpenclawConfig(api.config);
+  const fromPlugin = api.pluginConfig ?? {};
+  const raw: Record<string, unknown> = { ...fromFile, ...fromPlugin };
   return {
     blueprintVersion:
       typeof raw["blueprintVersion"] === "string"
@@ -227,6 +259,10 @@ export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
       typeof raw["inferenceProvider"] === "string"
         ? raw["inferenceProvider"]
         : DEFAULT_PLUGIN_CONFIG.inferenceProvider,
+    stewardUrl:
+      typeof raw["stewardUrl"] === "string" && raw["stewardUrl"].trim()
+        ? raw["stewardUrl"].trim()
+        : undefined,
   };
 }
 
@@ -235,6 +271,9 @@ export function getPluginConfig(api: OpenClawPluginApi): NemoClawConfig {
 // ---------------------------------------------------------------------------
 
 export default function register(api: OpenClawPluginApi): void {
+  const pluginCfg = getPluginConfig(api);
+  setPluginStewardBaseUrl(pluginCfg.stewardUrl);
+
   // 1. Register /nemoclaw slash command (chat interface)
   api.registerCommand({
     name: "nemoclaw",
@@ -260,6 +299,13 @@ export default function register(api: OpenClawPluginApi): void {
   api.logger.info(`  │  Provider:  ${bannerProvider.padEnd(40)}│`);
   api.logger.info(`  │  Model:     ${bannerModel.padEnd(40)}│`);
   api.logger.info("  │  Slash:     /nemoclaw                               │");
+  if (pluginCfg.stewardUrl) {
+    const s =
+      pluginCfg.stewardUrl.length > 40
+        ? `${pluginCfg.stewardUrl.slice(0, 37)}...`
+        : pluginCfg.stewardUrl;
+    api.logger.info(`  │  Steward:   ${s.padEnd(40)}│`);
+  }
   api.logger.info("  └─────────────────────────────────────────────────────┘");
   api.logger.info("");
 }

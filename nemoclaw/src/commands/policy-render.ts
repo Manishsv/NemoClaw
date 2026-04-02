@@ -252,6 +252,8 @@ export function renderMutateBusiness(args: {
   rationale: string;
   highRisk: boolean;
   executed: boolean;
+  /** Present when decision is needs_approval: authorize-time audit id for `/nemoclaw approval complete`. */
+  authorizeAuditId?: string;
 }): string {
   const r = shortenOneLine(args.rationale, 220);
   if (args.decision === "deny") {
@@ -269,15 +271,29 @@ export function renderMutateBusiness(args: {
       .join("\n");
   }
   if (args.decision === "needs_approval") {
+    const handle = args.authorizeAuditId?.trim()
+      ? `Operator handle (authorize audit): \`${args.authorizeAuditId.trim()}\``
+      : null;
+    const nextCmd = args.authorizeAuditId?.trim()
+      ? `  \`/nemoclaw approval complete ${args.authorizeAuditId.trim()}\``
+      : "  `/nemoclaw approval complete <authorize-audit-id>` (use **audit** or **details** on this command to show the id)";
     return [
       "**Approval required**",
       "",
+      `Status: Governance needs an operator approval before this change can run.`,
       `Sandbox: ${args.sandboxName}`,
       "",
-      "Outcome: waiting for an authorized approver.",
+      "Outcome: not applied yet — waiting for approval.",
       r ? `Why: ${r}` : null,
       "",
-      "Next step: have an operator approve in your governance workflow, then retry.",
+      handle,
+      "",
+      "Next step (operator):",
+      nextCmd,
+      "",
+      "Note: Steward keeps audits **in memory** — if **`uvicorn` restarted** (e.g. **`--reload`** saved a file) or **`STEWARD_URL`** points at a different instance, **`approval complete`** will get **404**. Re-run this policy command on the **same** running Steward, then complete approval **before** restarting Steward.",
+      "",
+      "Records: after completion, use `/nemoclaw records audit <id>` if you need decision vs execution detail.",
     ]
       .filter(Boolean)
       .join("\n");
