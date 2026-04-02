@@ -51,7 +51,7 @@ export function renderAuditRecord(audit: unknown): string {
     kind ? `Kind: ${kind}` : null,
     decision ? `Governance decision: ${decision}` : null,
     rationale ? `Rationale: ${rationale}` : null,
-    action ? `Action: ${action}` : null,
+    action ? `Action: \`${action}\`` : null,
     purpose ? `Purpose: ${purpose}` : null,
     "",
     "**Linked records**",
