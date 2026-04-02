@@ -959,7 +959,124 @@ describe("commands/slash", () => {
       expect(result.text).toContain(
         "Selected (pending approval): Allow Node to reach the npm registry (fix npm installs)",
       );
-      expect(result.text).toContain("Next step: ask an operator to approve");
+      expect(result.text).toContain("Operator handle (authorize audit):");
+      expect(result.text).toContain("audit-eval-1");
+      expect(result.text).toContain("/nemoclaw approval complete audit-eval-1");
+
+      fetchSpy.mockRestore();
+    });
+
+    it("integration: request needs_approval then approval complete replays selected proposal", async () => {
+      const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation((url, init) => {
+        const u = urlToString(url);
+        if (u.includes("/action/evaluate")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                evaluations: [
+                  {
+                    id: "approve-npm-registry",
+                    label: "Allow Node to reach the npm registry (fix npm installs)",
+                    decision: "needs_approval",
+                    rationale: "Approval required by policy.",
+                    audit_id: "audit-eval-need",
+                    risk_tier: "medium",
+                  },
+                ],
+                selection: {
+                  selected_id: "approve-npm-registry",
+                  selected_label: "Allow Node to reach the npm registry (fix npm installs)",
+                  decision: "needs_approval",
+                  rationale: "Selected the best fix but it requires approval.",
+                  rule: "goal_aware_lowest_risk_needs_approval",
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (u.includes("/audit/audit-eval-need")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "audit-eval-need",
+                governance_proposal_id: "gp-rq",
+                proposal: {
+                  action: "openshell.draft_policy.approve_matching",
+                  purpose: "Enable npm installs by allowing registry access for Node",
+                  role: "agent",
+                  context: {},
+                  parameters: {
+                    sandbox_name: "manz",
+                    match: {
+                      host: "registry.npmjs.org",
+                      port: 443,
+                      binary_path: "/usr/local/bin/node",
+                    },
+                  },
+                },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (u.includes("/approval-requests") && !u.includes("/decision")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "ar-rq",
+                state: "requested",
+                governance_proposal_id: "gp-rq",
+                decision_record_id: "dr",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (u.includes("/approval-requests/ar-rq/decision")) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                id: "ar-rq",
+                state: "approved",
+                governance_proposal_id: "gp-rq",
+                decision_record_id: "dr",
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          );
+        }
+        if (u.includes("/action/execute")) {
+          const body = typeof init?.body === "string" ? JSON.parse(init.body) : {};
+          expect(body.proposal.action).toBe("openshell.draft_policy.approve_matching");
+          expect(body.proposal.parameters.sandbox_name).toBe("manz");
+          expect(body.proposal.context.steward_resume_proposal_id).toBe("gp-rq");
+          expect(body.proposal.context.approval_request_id).toBe("ar-rq");
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({ audit_id: "exec-rq", status: "executed", result: { ok: true } }),
+              {
+                status: 200,
+                headers: { "content-type": "application/json" },
+              },
+            ),
+          );
+        }
+        throw new Error(`unexpected url: ${u}`);
+      });
+
+      const out = await handleSlashCommand(
+        makeCtx("request manz Please make npm installs work in this sandbox."),
+        makeApi(),
+      );
+      expect(out.text).toContain("/nemoclaw approval complete audit-eval-need");
+
+      const exec = await handleSlashCommand(
+        makeCtx("approval complete audit-eval-need"),
+        makeApi(),
+      );
+      expect(exec.text).toContain("Approval completed and execution finished");
+      expect(exec.text).toContain("approve_matching");
 
       fetchSpy.mockRestore();
     });

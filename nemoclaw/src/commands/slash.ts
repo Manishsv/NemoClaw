@@ -557,6 +557,7 @@ async function slashRequest(
     .join("\n");
 
   if (chosen.decision === "needs_approval") {
+    const handle = chosen.audit_id || "";
     const base = [
       "**Outcome**",
       "",
@@ -575,7 +576,14 @@ async function slashRequest(
         ? `Governance note: ${shortenOneLine(chosen.rationale, 200)}`
         : null,
       "",
-      "Next step: ask an operator to approve this change, then retry the same request.",
+      handle ? `Operator handle (authorize audit): \`${handle}\`` : null,
+      "",
+      "Next step (operator):",
+      handle
+        ? `  \`/nemoclaw approval complete ${handle}\``
+        : "  `/nemoclaw approval complete <authorize-audit-id>`",
+      "",
+      "After approval, re-run the same `/nemoclaw request ...` (or inspect with `/nemoclaw records`).",
     ]
       .filter(Boolean)
       .join("\n");
